@@ -150,74 +150,6 @@ class _module_function(torch.autograd.Function):
         output = output.view(Bi, Ni, Do)
         return (output, native_ctx), (0, None)
 
-
-class _padding_function(torch.autograd.Function):
-    @staticmethod
-    def forward(native_tcnn_module, input, params, loss_scale):
-        # pad the input if it's size is not a multiple of the input_granularity
-        input_padded = _pad(input, cast=True)
-        # call the module function with padded inputs
-        return *_module_function.apply(native_tcnn_module, input_padded, params, loss_scale), input_padded
-
-    @staticmethod
-    def setup_context(ctx, inputs, outputs):
-        # If no output gradient is provided, no need to
-        # automatically materialize it as torch.zeros.
-        ctx.set_materialize_grads(False)
-
-        # unpack forward pass inputs / outputs
-        native_tcnn_module, input, params, loss_scale = inputs
-        output, native_ctx, input_padded = outputs
-
-        # save the padded input for the backward pass instead of the original one
-        ctx.save_for_backward(input, input_padded, params, output)
-        ctx.native_tcnn_module = native_tcnn_module
-        ctx.native_ctx = native_ctx
-        ctx.loss_scale = loss_scale
-        ctx.batch_size = input.shape[0]
-
-    @staticmethod
-    def backward(ctx, doutput, _0, _1):
-        input, input_padded, params, output = ctx.saved_tensors
-
-        if doutput is None :
-            return None, None, None, None
-
-        # print("_padding_function bwd", doutput.shape, input.shape, input_padded.shape, params.shape, output.shape, ctx.batch_size, ctx.n_output_dims)
-        if not doutput.is_cuda:
-            warnings.warn("doutput must be a CUDA tensor, but isn't. This indicates suboptimal performance.")
-            doutput = doutput.cuda()
-
-        input_grad, params_grad = _module_function_backward.apply(ctx, doutput, input, params, output)
-
-        # print("_padding_function output", input_grad.shape, params_grad.shape)
-        return None, null_tensor_to_none(input_grad), null_tensor_to_none(params_grad), None
-
-    @staticmethod
-    def vmap(info, in_dims, *args):
-        _, input_bddim, _, _ = in_dims
-        native_tcnn_module, input, params, loss_scale = args
-
-        input = input.movedim(input_bddim, 0)
-        Bi, Ni, Di = input.shape
-        input = input.view(Bi * Ni, Di)
-        # print("_padding_function vmap forward", info, in_dims, input.shape, params.shape)
-        input = _pad(input, cast=True)
-
-        output, native_ctx, input_padded = _padding_function.apply(
-            native_tcnn_module,
-            input,
-            params,
-            loss_scale
-        )
-        No, Do = output.shape
-        # print("_padding_function vmap forward output", output.shape, Bi, Ni, Do)
-        output = output[:Bi * Ni, :].view(Bi, Ni, Do)
-        # print("_padding_function vmap output reshape", output.shape)
-        input_padded = input_padded[:Bi * Ni, :].view(Bi, Ni, Di)
-
-        return (output, native_ctx, input_padded), (0, None, None)
-
 class _module_function_backward(torch.autograd.Function):
     @staticmethod
     def forward(ctx_fwd, doutput, input, params, output):
@@ -225,10 +157,11 @@ class _module_function_backward(torch.autograd.Function):
             scaled_grad = doutput * ctx_fwd.loss_scale
             # print("_module_function_backward forward", input.shape, params.shape, output.shape, scaled_grad.shape)
             # print("_module_function_backward forward", input.dtype, params.dtype, output.dtype, scaled_grad.dtype)
-            input = _pad(input, cast=True)
+            # print("_module_function_backward forward", input.requires_grad, params.requires_grad, output.requires_grad, scaled_grad.requires_grad)
             input_grad, params_grad = ctx_fwd.native_tcnn_module.bwd(ctx_fwd.native_ctx, input, params, output, scaled_grad)
             input_grad = null_tensor_like(input) if input_grad is None else (input_grad / ctx_fwd.loss_scale)
             params_grad = null_tensor_like(params) if params_grad is None else (params_grad / ctx_fwd.loss_scale)
+            # print("_module_function_backward forward", input_grad.shape, params_grad.shape)
         return input_grad, params_grad
 
     @staticmethod
@@ -290,18 +223,145 @@ class _module_function_backward(torch.autograd.Function):
         Do = output.shape[-1]
         output = output.reshape(B * N, Do)
 
+        # print("_module_function_backward vmap padding", doutput.shape, input.shape, output.shape)
+        # print("_module_function_backward vmap padding", doutput.dtype, input.dtype, output.dtype)
+        # doutput, input, output = maybe_pad(doutput, False), maybe_pad(input, True), maybe_pad(output, False)
+        # print("_module_function_backward vmap padding", doutput.shape, input.shape, output.shape)
+        # print("_module_function_backward vmap padding", doutput.dtype, input.dtype, output.dtype)
+        input_grad, params_grad = _module_function_backward.apply(ctx_fwd, doutput, input, params, output)
+        # print("_module_function_backward vmap output", input_grad.shape, params_grad.shape)
+
+        def unpack(x):
+            if x.numel() > 1:
+                D = x.shape[-1]
+                # crop x to remove padding and unflatten
+                return (x[:B * N, ...].view(B, N, D), 0)
+            return (x, None)
+
+        input_grad, input_grad_bdim = unpack(input_grad)
+        params_grad,  params_grad_bdim = params_grad.expand(info.batch_size, *params_grad.shape), 0
+        return (input_grad, params_grad), (input_grad_bdim, params_grad_bdim)
+
+
+class _padding_function(_module_function):
+    @staticmethod
+    def forward(native_tcnn_module, input, params, loss_scale):
+        # pad the input if it's size is not a multiple of the input_granularity
+        input_padded = _pad(input, cast=True)
+        # call the module function with padded inputs
+        return *_module_function.apply(native_tcnn_module, input_padded, params, loss_scale), input_padded
+
+    @staticmethod
+    def setup_context(ctx, inputs, outputs):
+        # If no output gradient is provided, no need to
+        # automatically materialize it as torch.zeros.
+        ctx.set_materialize_grads(False)
+
+        # unpack forward pass inputs / outputs
+        native_tcnn_module, input, params, loss_scale = inputs
+        output, native_ctx, input_padded = outputs
+
+        # save the padded input for the backward pass instead of the original one
+        ctx.save_for_backward(input, input_padded, params, output)
+        ctx.native_tcnn_module = native_tcnn_module
+        ctx.native_ctx = native_ctx
+        ctx.loss_scale = loss_scale
+        ctx.batch_size = input.shape[0]
+
+    @staticmethod
+    def backward(ctx, doutput, _0, _1):
+        input, input_padded, params, output = ctx.saved_tensors
+
+        if doutput is None :
+            return None, None, None, None
+
+        print("_padding_function bwd", doutput.shape, input.shape, input_padded.shape, params.shape, output.shape, ctx.batch_size)
+        print("_padding_function bwd", doutput.requires_grad, input.requires_grad, input_padded.requires_grad, params.requires_grad, output.requires_grad)
+        if not doutput.is_cuda:
+            warnings.warn("doutput must be a CUDA tensor, but isn't. This indicates suboptimal performance.")
+            doutput = doutput.cuda()
+
+        input_grad, params_grad = _padding_function_backward.apply(ctx, doutput, input_padded, params, output)
+
+        def unpad(x):
+            if x is not None:
+                print("x input shape", x.shape, x.grad)
+                # out = torch.tensor(x[:ctx.batch_size, :].clone)
+                out = x[:ctx.batch_size, :].clone()
+                # out[:] = x[:ctx.batch_size, :]
+                print("x output shape", out.shape, out.grad)
+                return out
+            else:
+                return None
+
+        print("_padding_function output", input_grad.shape, params_grad.shape)
+        input_grad = unpad(null_tensor_to_none(input_grad))
+        # print("_padding_function output", input_grad.shape, params_grad.shape)
+        return None, input_grad, null_tensor_to_none(params_grad), None
+
+    @staticmethod
+    def vmap(info, in_dims, *args):
+        _, input_bddim, _, _ = in_dims
+        native_tcnn_module, input, params, loss_scale = args
+
+        input = input.movedim(input_bddim, 0)
+        Bi, Ni, Di = input.shape
+        input = input.view(Bi * Ni, Di)
+        # print("_padding_function vmap forward", info, in_dims, input.shape, params.shape)
+        input = _pad(input, cast=True)
+
+        output, native_ctx, input_padded = _padding_function.apply(
+            native_tcnn_module,
+            input,
+            params,
+            loss_scale
+        )
+        No, Do = output.shape
+        # print("_padding_function vmap forward output", output.shape, Bi, Ni, Do)
+        output = output[:Bi * Ni, :].view(Bi, Ni, Do)
+        # print("_padding_function vmap output reshape", output.shape)
+        input_padded = input_padded[:Bi * Ni, :].view(Bi, Ni, Di)
+
+        return (output, native_ctx, input_padded), (0, None, None)
+
+class _padding_function_backward(_module_function_backward):
+    @staticmethod
+    def forward(ctx_fwd, doutput, input, params, output):
+        # input = _pad(input, cast=True)
+        # input.requires_grad = True
+        return _module_function_backward.apply(ctx_fwd, doutput, input, params, output)
+
+    @staticmethod
+    def vmap(info, in_dims, *fwd_args):
+        _, doutput_bdim, input_bdim, _, output_bdim = in_dims
+        ctx_fwd, doutput, input, params, output = fwd_args
+        # print("_padding_function_backward vmap", info, in_dims, doutput.shape, input.shape, params.shape, output.shape)
+
+        # move batch dim to 0 and flatten along that dimension
+        doutput = _maybe_expand_bdim_at_front(doutput, doutput_bdim, info.batch_size)
+        B, N, Ddo = doutput.shape
+        doutput = doutput.view(B * N, Ddo)
+
+        input = _maybe_expand_bdim_at_front(input, input_bdim, info.batch_size)
+        Di = input.shape[-1]
+        input = input.view(B * N, Di)
+
+        output = _maybe_expand_bdim_at_front(output, output_bdim, info.batch_size)
+        Do = output.shape[-1]
+        output = output.reshape(B * N, Do)
+
         def maybe_pad(x, cast=False):
             if info.batch_size > 1:
                 return _pad(x, cast)
             return x.to(torch.float32).contiguous() if cast else x.contiguous()
 
-        # print("_module_function_backward vmap padding", doutput.shape, input.shape, output.shape)
-        # print("_module_function_backward vmap padding", doutput.dtype, input.dtype, output.dtype)
+        print("_padding_function_backward vmap padding", doutput.shape, input.shape, output.shape)
+        print("_padding_function_backward vmap padding", doutput.dtype, input.dtype, output.dtype)
         doutput, input, output = maybe_pad(doutput, False), maybe_pad(input, True), maybe_pad(output, False)
-        # print("_module_function_backward vmap padding", doutput.shape, input.shape, output.shape)
-        # print("_module_function_backward vmap padding", doutput.dtype, input.dtype, output.dtype)
-        input_grad, params_grad = _module_function_backward.apply(ctx_fwd, doutput, input, params, output)
-        # print("_module_function_backward vmap output", input_grad.shape, params_grad.shape)
+        print("_padding_function_backward vmap padding", doutput.shape, input.shape, output.shape)
+        print("_padding_function_backward vmap padding", doutput.dtype, input.dtype, output.dtype)
+        input_grad, params_grad = _padding_function_backward.apply(ctx_fwd, doutput, input, params, output)
+        # print("_padding_function_backward vmap output", input_grad.shape, params_grad.shape)
 
         def unpack(x):
             if x.numel() > 1:
@@ -341,6 +401,19 @@ class Module(torch.nn.Module):
             self.params.to(_torch_precision(self.native_tcnn_module.param_precision())).contiguous(),
             self.loss_scale,
         )
+
+
+        # batch_size = x.shape[0]
+        # batch_size_granularity = int(_C.batch_size_granularity())
+        # padded_batch_size = (batch_size + batch_size_granularity-1) // batch_size_granularity * batch_size_granularity
+
+        # x_padded = x if batch_size == padded_batch_size else torch.nn.functional.pad(x, [0, 0, 0, padded_batch_size - batch_size])
+        # output, _ = _module_function.apply(
+        #     self.native_tcnn_module,
+        #     x_padded.to(torch.float).contiguous(),
+        #     self.params.to(_torch_precision(self.native_tcnn_module.param_precision())).contiguous(),
+        #     self.loss_scale
+        # )
         return output[:batch_size, :self.n_output_dims]
 
     def __getstate__(self):
