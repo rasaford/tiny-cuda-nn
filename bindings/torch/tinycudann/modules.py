@@ -271,11 +271,9 @@ class _padding_function(torch.autograd.Function):
             params,
             loss_scale
         )
+        # remove padding from output
         No, Do = output.shape
-        # print("_padding_function vmap forward output", output.shape, Bi, Ni, Do)
         output = output[:Bi * Ni, :].view(Bi, Ni, Do)
-        # print("_padding_function vmap output reshape", output.shape)
-        # input_padded = input_padded[:Bi * Ni, :].view(Bi, Ni, Di)
         return (output, native_ctx), (0, None)
 
 class _padding_function_backward(torch.autograd.Function):
@@ -385,10 +383,20 @@ class Module(torch.nn.Module):
             warnings.warn("input must be a CUDA tensor, but isn't. This indicates suboptimal performance.")
             x = x.cuda()
 
+        # FIXME: This is a hacky implementation of allowing vmap(...) calls over
+        # tiny-cuda-nn modules. The issue is that calls to the cuda fwd / bwd
+        # functions require the input to be padded to a multiple of
+        # _C.batch_size_granularity(). This padding cannot be done inside a
+        # torch.autograd.Function and therefore needs to be done here.
+        # However, when calling forward() with vmap(..) batch_size will be 1
+        # causing excessive padding and much wasted computation. To avoid this,
+        # we call _padding_* versions of the above autograd functions which
+        # pad the input once the entire vmap chunk has been collected.
+        # Since a module cannot tell if it's currently called in a vmap(...)
+        # we use the below distinction on batch_size == 1
         batch_size = x.shape[0]
         if batch_size == 1:
             # batch size == 1 very likely indicates that we're vmapping over the input
-            # Therefore, we apply the automatically padding version of the module
             output, _ = _padding_function.apply(
                 self.native_tcnn_module,
                 x,
@@ -396,6 +404,8 @@ class Module(torch.nn.Module):
                 self.loss_scale,
             )
         else:
+            # if we're not in a vmap context, padding can be applied to the
+            # entire supplied batch directly
             batch_size_granularity = int(_C.batch_size_granularity())
             padded_batch_size = (batch_size + batch_size_granularity-1) // batch_size_granularity * batch_size_granularity
 
