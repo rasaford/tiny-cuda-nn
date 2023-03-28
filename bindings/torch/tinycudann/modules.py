@@ -17,9 +17,11 @@ ALL_COMPUTE_CAPABILITIES = [20, 21, 30, 35, 37, 50, 52, 53, 60, 61, 62, 70, 72, 
 if not torch.cuda.is_available():
     raise EnvironmentError("Unknown compute capability. Ensure PyTorch with CUDA support is installed.")
 
+
 def _get_device_compute_capability(idx):
     major, minor = torch.cuda.get_device_capability(idx)
     return major * 10 + minor
+
 
 def _get_system_compute_capability():
     num_devices = torch.cuda.device_count()
@@ -33,6 +35,7 @@ def _get_system_compute_capability():
             f"This may result in suboptimal performance."
         )
     return system_capability
+
 
 # Determine the capability of the system as the minimum of all
 # devices, ensuring that we have no runtime errors.
@@ -49,13 +52,18 @@ for cc in reversed(ALL_COMPUTE_CAPABILITIES):
     try:
         _C = importlib.import_module(f"tinycudann_bindings._{cc}_C")
         if cc != system_compute_capability:
-            warnings.warn(f"tinycudann was built for lower compute capability ({cc}) than the system's ({system_compute_capability}). Performance may be suboptimal.")
+            warnings.warn(
+                f"tinycudann was built for lower compute capability ({cc}) than the system's ({system_compute_capability}). Performance may be suboptimal."
+            )
         break
     except ModuleNotFoundError:
         pass
 
 if _C is None:
-    raise EnvironmentError(f"Could not find compatible tinycudann extension for compute capability {system_compute_capability}.")
+    raise EnvironmentError(
+        f"Could not find compatible tinycudann extension for compute capability {system_compute_capability}."
+    )
+
 
 def _torch_precision(tcnn_precision):
     if tcnn_precision == _C.Precision.Fp16:
@@ -65,24 +73,28 @@ def _torch_precision(tcnn_precision):
     else:
         raise ValueError(f"Unknown precision {tcnn_precision}")
 
+
 def free_temporary_memory():
     # Ensure all Python objects (potentially pointing
     # to temporary TCNN allocations) are cleaned up.
     gc.collect()
     _C.free_temporary_memory()
 
+
 def null_tensor_like(tensor):
     return torch.empty([], dtype=tensor.dtype, device=tensor.device)
+
 
 def null_tensor_to_none(tensor):
     if len(tensor.shape) == 0:
         return None
     return tensor
 
+
 def _pad(x, cast=False):
     batch_size = x.shape[0]
     batch_size_granularity = int(_C.batch_size_granularity())
-    padded_batch_size = (batch_size + batch_size_granularity-1) // batch_size_granularity * batch_size_granularity
+    padded_batch_size = (batch_size + batch_size_granularity - 1) // batch_size_granularity * batch_size_granularity
     do_cast = lambda x: x.to(torch.float32) if cast else x
     if batch_size != padded_batch_size:
         x = torch.nn.functional.pad(x, [0, 0, 0, padded_batch_size - batch_size])
@@ -90,16 +102,19 @@ def _pad(x, cast=False):
     else:
         return do_cast(x)
 
+
 def _unpad(x, orig_size):
     if x is not None and x.ndim == 2:
         return x[:orig_size, :]
     else:
         return x
 
+
 def _maybe_expand_bdim_at_front(x, x_bdim, batch_size):
     if x_bdim is None:
         return x.expand(batch_size, *x.shape)
     return x.movedim(x_bdim, 0)
+
 
 class _module_function(torch.autograd.Function):
     @staticmethod
@@ -135,12 +150,15 @@ class _module_function(torch.autograd.Function):
 
         return None, null_tensor_to_none(input_grad), null_tensor_to_none(params_grad), None
 
+
 class _module_function_backward(torch.autograd.Function):
     @staticmethod
     def forward(ctx_fwd, doutput, input, params, output):
         with torch.no_grad():
             scaled_grad = doutput * ctx_fwd.loss_scale
-            input_grad, params_grad = ctx_fwd.native_tcnn_module.bwd(ctx_fwd.native_ctx, input, params, output, scaled_grad)
+            input_grad, params_grad = ctx_fwd.native_tcnn_module.bwd(
+                ctx_fwd.native_ctx, input, params, output, scaled_grad
+            )
             input_grad = null_tensor_like(input) if input_grad is None else (input_grad / ctx_fwd.loss_scale)
             params_grad = null_tensor_like(params) if params_grad is None else (params_grad / ctx_fwd.loss_scale)
         return input_grad, params_grad
@@ -167,13 +185,8 @@ class _module_function_backward(torch.autograd.Function):
             # NOTE: preserves requires_grad info (this function is in no_grad() context by default when invoking loss.backward())
             doutput = doutput * ctx.ctx_fwd.loss_scale
         with torch.no_grad():
-            print("bwd_bwd_input")
             doutput_grad, params_grad, input_grad = ctx.ctx_fwd.native_tcnn_module.bwd_bwd_input(
-                ctx.ctx_fwd.native_ctx,
-                input,
-                params,
-                dinput_grad,
-                doutput
+                ctx.ctx_fwd.native_ctx, input, params, dinput_grad, doutput
             )
             # NOTE: be cautious when multiplying and dividing loss_scale
             #       doutput_grad uses dinput_grad
@@ -209,11 +222,11 @@ class _module_function_backward(torch.autograd.Function):
             if x.numel() > 1:
                 D = x.shape[-1]
                 # crop x to remove padding and unflatten
-                return (x[:B * N, ...].view(B, N, D), 0)
+                return (x[: B * N, ...].view(B, N, D), 0)
             return (x, None)
 
         input_grad, input_grad_bdim = unpack(input_grad)
-        params_grad,  params_grad_bdim = params_grad.expand(info.batch_size, *params_grad.shape), 0
+        params_grad, params_grad_bdim = params_grad.expand(info.batch_size, *params_grad.shape), 0
         return (input_grad, params_grad), (input_grad_bdim, params_grad_bdim)
 
 
@@ -265,23 +278,21 @@ class _padding_function(torch.autograd.Function):
         # padding can only be performed when vmaping
         input = _pad(input, cast=True)
 
-        output, native_ctx = _padding_function.apply(
-            native_tcnn_module,
-            input,
-            params,
-            loss_scale
-        )
+        output, native_ctx = _padding_function.apply(native_tcnn_module, input, params, loss_scale)
         # remove padding from output
         No, Do = output.shape
-        output = output[:Bi * Ni, :].view(Bi, Ni, Do)
+        output = output[: Bi * Ni, :].view(Bi, Ni, Do)
         return (output, native_ctx), (0, None)
+
 
 class _padding_function_backward(torch.autograd.Function):
     @staticmethod
     def forward(ctx_fwd, doutput, input, params, output):
         with torch.no_grad():
             scaled_grad = doutput * ctx_fwd.loss_scale
-            input_grad, params_grad = ctx_fwd.native_tcnn_module.bwd(ctx_fwd.native_ctx, input, params, output, scaled_grad)
+            input_grad, params_grad = ctx_fwd.native_tcnn_module.bwd(
+                ctx_fwd.native_ctx, input, params, output, scaled_grad
+            )
             input_grad = null_tensor_like(input) if input_grad is None else (input_grad / ctx_fwd.loss_scale)
             params_grad = null_tensor_like(params) if params_grad is None else (params_grad / ctx_fwd.loss_scale)
         return input_grad, params_grad
@@ -308,13 +319,8 @@ class _padding_function_backward(torch.autograd.Function):
             # NOTE: preserves requires_grad info (this function is in no_grad() context by default when invoking loss.backward())
             doutput = doutput * ctx.ctx_fwd.loss_scale
         with torch.no_grad():
-            print("bwd_bwd_input")
             doutput_grad, params_grad, input_grad = ctx.ctx_fwd.native_tcnn_module.bwd_bwd_input(
-                ctx.ctx_fwd.native_ctx,
-                input,
-                params,
-                dinput_grad,
-                doutput
+                ctx.ctx_fwd.native_ctx, input, params, dinput_grad, doutput
             )
             # NOTE: be cautious when multiplying and dividing loss_scale
             #       doutput_grad uses dinput_grad
@@ -356,11 +362,11 @@ class _padding_function_backward(torch.autograd.Function):
             if x.numel() > 1:
                 D = x.shape[-1]
                 # crop x to remove padding and unflatten
-                return (x[:B * N, ...].view(B, N, D), 0)
+                return (x[: B * N, ...].view(B, N, D), 0)
             return (x, None)
 
         input_grad, input_grad_bdim = crop_add_batch_dim(input_grad)
-        params_grad,  params_grad_bdim = params_grad.expand(info.batch_size, *params_grad.shape), 0
+        params_grad, params_grad_bdim = params_grad.expand(info.batch_size, *params_grad.shape), 0
         return (input_grad, params_grad), (input_grad_bdim, params_grad_bdim)
 
 
@@ -394,8 +400,8 @@ class Module(torch.nn.Module):
         # pad the input once the entire vmap chunk has been collected.
         # Since a module cannot tell if it's currently called in a vmap(...)
         # we use the below distinction on batch_size == 1
-        batch_size = x.shape[0]
-        if batch_size == 1:
+
+        def vmap(x):
             # batch size == 1 very likely indicates that we're vmapping over the input
             output, _ = _padding_function.apply(
                 self.native_tcnn_module,
@@ -403,20 +409,39 @@ class Module(torch.nn.Module):
                 self.params.to(_torch_precision(self.native_tcnn_module.param_precision())).contiguous(),
                 self.loss_scale,
             )
-        else:
+            return output
+
+        def pad(x):
             # if we're not in a vmap context, padding can be applied to the
             # entire supplied batch directly
             batch_size_granularity = int(_C.batch_size_granularity())
-            padded_batch_size = (batch_size + batch_size_granularity-1) // batch_size_granularity * batch_size_granularity
+            padded_batch_size = (
+                (batch_size + batch_size_granularity - 1) // batch_size_granularity * batch_size_granularity
+            )
 
-            x_padded = x if batch_size == padded_batch_size else torch.nn.functional.pad(x, [0, 0, 0, padded_batch_size - batch_size])
+            x_padded = (
+                x
+                if batch_size == padded_batch_size
+                else torch.nn.functional.pad(x, [0, 0, 0, padded_batch_size - batch_size])
+            )
             output, _ = _module_function.apply(
                 self.native_tcnn_module,
                 x_padded.to(torch.float).contiguous(),
                 self.params.to(_torch_precision(self.native_tcnn_module.param_precision())).contiguous(),
-                self.loss_scale
+                self.loss_scale,
             )
-        return output[:batch_size, :self.n_output_dims]
+            return output
+
+        batch_size = x.shape[0]
+        try:
+            if batch_size == 1:
+                output = vmap(x)
+            else:
+                output = pad(x)
+        except RuntimeError:
+            output = pad(x)
+
+        return output[:batch_size, : self.n_output_dims]
 
     def __getstate__(self):
         """Return state values to be pickled."""
@@ -432,6 +457,7 @@ class Module(torch.nn.Module):
 
     def extra_repr(self):
         return f"n_input_dims={self.n_input_dims}, n_output_dims={self.n_output_dims}, seed={self.seed}, dtype={self.dtype}, hyperparams={self.native_tcnn_module.hyperparams()}"
+
 
 class NetworkWithInputEncoding(Module):
     """
@@ -461,9 +487,12 @@ class NetworkWithInputEncoding(Module):
     seed: `int`
         Seed for pseudorandom parameter initialization
     """
+
     def __init__(self, n_input_dims, n_output_dims, encoding_config, network_config, seed=1337):
         if not _C.has_networks():
-            raise RuntimeError(f"Cannot create `NetworkWithInputEncoding` because tiny-cuda-nn was not compiled with neural network support.")
+            raise RuntimeError(
+                f"Cannot create `NetworkWithInputEncoding` because tiny-cuda-nn was not compiled with neural network support."
+            )
 
         self.n_input_dims = n_input_dims
         self.n_output_dims = n_output_dims
@@ -473,7 +502,10 @@ class NetworkWithInputEncoding(Module):
         super(NetworkWithInputEncoding, self).__init__(seed=seed)
 
     def _native_tcnn_module(self):
-        return _C.create_network_with_input_encoding(self.n_input_dims, self.n_output_dims, self.encoding_config, self.network_config)
+        return _C.create_network_with_input_encoding(
+            self.n_input_dims, self.n_output_dims, self.encoding_config, self.network_config
+        )
+
 
 class Network(Module):
     """
@@ -497,9 +529,12 @@ class Network(Module):
     seed: `int`
         Seed for pseudorandom parameter initialization
     """
+
     def __init__(self, n_input_dims, n_output_dims, network_config, seed=1337):
         if not _C.has_networks():
-            raise RuntimeError(f"Cannot create `Network` because tiny-cuda-nn was not compiled with neural network support.")
+            raise RuntimeError(
+                f"Cannot create `Network` because tiny-cuda-nn was not compiled with neural network support."
+            )
 
         self.n_input_dims = n_input_dims
         self.n_output_dims = n_output_dims
@@ -509,6 +544,7 @@ class Network(Module):
 
     def _native_tcnn_module(self):
         return _C.create_network(self.n_input_dims, self.n_output_dims, self.network_config)
+
 
 class Encoding(Module):
     """
@@ -535,6 +571,7 @@ class Encoding(Module):
         may yield higher numerical accuracy, but is generally slower.
         A value of `torch.half` may not be supported on all systems.
     """
+
     def __init__(self, n_input_dims, encoding_config, seed=1337, dtype=None):
         self.n_input_dims = n_input_dims
         self.encoding_config = encoding_config
